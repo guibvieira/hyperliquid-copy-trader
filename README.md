@@ -1,7 +1,9 @@
 # Hyperliquid Copy Trader
 
 <p align="center">
-  <img src="https://www.cryptoninjas.net/wp-content/uploads/hyperliquid-logo-330x330.webp" alt="Hyperliquid Logo" width="200"/>
+  <a href="https://hyperfoundation.org/" target="_blank">
+    <img src="https://www.cryptoninjas.net/wp-content/uploads/hyperliquid-logo-330x330.webp" alt="Hyperliquid Logo" width="200"/>
+  </a>
 </p>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
