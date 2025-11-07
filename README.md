@@ -1,5 +1,9 @@
 # Hyperliquid Copy Trader
 
+<p align="center">
+  <img src="https://www.cryptoninjas.net/wp-content/uploads/hyperliquid-logo-330x330.webp" alt="Hyperliquid Logo" width="200"/>
+</p>
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![Docker](https://img.shields.io/badge/docker-ready-brightgreen.svg)](https://www.docker.com/)
@@ -27,15 +31,15 @@ docker-compose up -d
 ### Manual Installation
 
 1. Install Python 3.12+
-
 2. Install dependencies:
+
 ```bash
 pip install -r requirements.txt
 ```
 
 3. Configure .env file with your settings
-
 4. Run the bot:
+
 ```bash
 python src/main.py
 ```
@@ -88,11 +92,13 @@ BLOCKED_ASSETS=BTC,ETH,SOL
 ```
 
 When the target wallet trades these assets, the bot will:
+
 - Log a warning message
 - Skip copying the trade
 - Continue monitoring other assets normally
 
 This is useful for:
+
 - Avoiding high-volatility assets
 - Excluding assets you're manually trading
 - Managing risk by limiting exposure to certain markets
@@ -104,6 +110,7 @@ Note: Asset symbols are case-insensitive (BTC, btc, Btc all work).
 Position sizes are automatically calculated based on the ratio of your account balance to the target wallet balance.
 
 Example:
+
 - Target wallet: $100,000
 - Your account: $10,000
 - Ratio: 1:10
@@ -137,21 +144,25 @@ chmod +x *.sh       # Make executable (first time only)
 ### Manual Docker Commands
 
 Start bot:
+
 ```bash
 docker-compose up -d
 ```
 
 View logs:
+
 ```bash
 docker-compose logs -f
 ```
 
 Stop bot:
+
 ```bash
 docker-compose down
 ```
 
 Rebuild after code changes:
+
 ```bash
 docker-compose up -d --build
 ```
@@ -163,10 +174,11 @@ To enable Telegram notifications:
 1. Create bot with @BotFather on Telegram
 2. Get your bot token
 3. Send a message to your bot
-4. Get your chat ID from: https://api.telegram.org/bot<TOKEN>/getUpdates
+4. Get your chat ID from: https://api.telegram.org/bot `<TOKEN>`/getUpdates
 5. Add both values to .env file
 
 Available commands:
+
 - /status - Bot status and balance
 - /positions - Current positions
 - /pnl - Profit and loss report
@@ -186,3 +198,7 @@ Discord: maskiplays
 If you find this bot useful, donations are appreciated:
 
 Arbitrum USDC: 0x2987F53372c02D1a4C67241aA1840C1E83c480fF
+
+## Final Thoughts
+
+Hyperliquid.
