@@ -6,6 +6,7 @@ requests==2.31.0
 
 # Ethereum/Web3
 eth-account==0.11.0
+eth-utils==2.3.2
 web3==6.11.3
 
 # Telegram bot
@@ -18,6 +19,7 @@ alembic==1.13.0
 # Utilities
 loguru==0.7.2
 pydantic==2.5.0
+msgpack==1.1.1
 
 # Testing
 pytest==7.4.3

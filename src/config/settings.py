@@ -84,7 +84,7 @@ class Settings(BaseModel):
         settings.hyperliquid.api_url = os.getenv('HYPERLIQUID_API_URL', settings.hyperliquid.api_url)
         settings.hyperliquid.wallet_address = os.getenv('HYPERLIQUID_WALLET_ADDRESS')
         settings.hyperliquid.private_key = os.getenv('HYPERLIQUID_PRIVATE_KEY')
-        
+
         settings.target_wallet = os.getenv('TARGET_WALLET_ADDRESS', settings.target_wallet)
         
         # Trading mode

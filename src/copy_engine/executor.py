@@ -1,12 +1,16 @@
 """Trade execution engine for Hyperliquid"""
 import time
+import json
 from typing import Optional, Dict, Any
 from decimal import Decimal
 from eth_account import Account
+from eth_account.messages import encode_structured_data
+from eth_utils import keccak, to_hex
 import aiohttp
+import msgpack
 
-from ..utils.logger import logger
-from ..hyperliquid.models import OrderType, OrderSide
+from utils.logger import logger
+from hyperliquid.models import OrderType, OrderSide
 
 
 class TradeExecutor:
@@ -39,9 +43,14 @@ class TradeExecutor:
         self.account = None
         if self.private_key and not self.dry_run:
             try:
-                self.account = Account.from_key(self.private_key)
+                # Handle private key format - add 0x prefix if missing
+                private_key = self.private_key.strip()
+                if not private_key.startswith('0x') and not private_key.startswith('0X'):
+                    private_key = '0x' + private_key
+                
+                self.account = Account.from_key(private_key)
                 # Validate address matches
-                if self.account.address.lower() != self.wallet_address:
+                if self.account.address.lower() != self.wallet_address.lower():
                     raise ValueError(
                         f"Private key address {self.account.address} doesn't match "
                         f"configured address {self.wallet_address}"
@@ -55,11 +64,31 @@ class TradeExecutor:
         else:
             logger.warning("⚠️ Running in DRY RUN mode - no real trades will be executed")
     
-    def _sign_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
+    def _action_hash(self, action: Dict[str, Any], vault_address: Optional[str], nonce: int) -> bytes:
+        """Compute action hash as per Hyperliquid SDK
+        
+        This is exactly how the official SDK computes the connectionId:
+        keccak(msgpack(action) + nonce_bytes + vault_address_indicator)
+        """
+        data = msgpack.packb(action)
+        data += nonce.to_bytes(8, "big")
+        if vault_address is None:
+            data += b"\x00"
+        else:
+            data += b"\x01"
+            # Convert address to bytes (strip 0x prefix if present)
+            addr = vault_address[2:] if vault_address.startswith("0x") else vault_address
+            data += bytes.fromhex(addr)
+        return keccak(data)
+    
+    def _sign_action(self, action: Dict[str, Any], vault_address: Optional[str] = None) -> Dict[str, Any]:
         """Sign an action using EIP-712 structured data signing
+        
+        This implementation matches the official hyperliquid-python-sdk exactly.
         
         Args:
             action: Action to sign
+            vault_address: Optional vault address for vault operations
             
         Returns:
             Signed action with signature
@@ -67,57 +96,188 @@ class TradeExecutor:
         if not self.account:
             raise ValueError("Cannot sign actions without account")
         
-        # Add timestamp nonce
-        timestamp = int(time.time() * 1000)
+        # Timestamp nonce in milliseconds
+        nonce = int(time.time() * 1000)
         
-        # Create EIP-712 structured data
+        # Compute the action hash (connectionId) - this is the critical part!
+        # The SDK hashes: msgpack(action) + nonce_bytes + vault_indicator
+        connection_id = self._action_hash(action, vault_address, nonce)
+        
+        # Construct phantom agent - "a" for mainnet, "b" for testnet
+        phantom_agent = {"source": "a", "connectionId": connection_id}
+        
+        # Create EIP-712 structured data - field order matters!
+        # Using exact same structure as official SDK
         structured_data = {
             "domain": {
-                "name": "Exchange",
-                "version": "1",
                 "chainId": 1337,
-                "verifyingContract": "0x0000000000000000000000000000000000000000"
+                "name": "Exchange",
+                "verifyingContract": "0x0000000000000000000000000000000000000000",
+                "version": "1",
             },
-            "primaryType": "Agent",
             "types": {
                 "Agent": [
                     {"name": "source", "type": "string"},
-                    {"name": "connectionId", "type": "bytes32"}
+                    {"name": "connectionId", "type": "bytes32"},
                 ],
                 "EIP712Domain": [
                     {"name": "name", "type": "string"},
                     {"name": "version", "type": "string"},
                     {"name": "chainId", "type": "uint256"},
-                    {"name": "verifyingContract", "type": "address"}
-                ]
+                    {"name": "verifyingContract", "type": "address"},
+                ],
             },
-            "message": {
-                "source": "a",  # "a" indicates API order
-                "connectionId": "0x" + "0" * 64
-            }
+            "primaryType": "Agent",
+            "message": phantom_agent,
         }
         
-        # Sign using sign_typed_data method
-        signed_message = self.account.sign_typed_data(
-            structured_data["domain"],
-            {"Agent": structured_data["types"]["Agent"]},
-            structured_data["message"]
-        )
+        # Encode and sign - using encode_structured_data as the SDK does
+        try:
+            encoded_message = encode_structured_data(structured_data)
+        except Exception as e:
+            logger.error(f"Failed to encode structured data: {e}")
+            logger.error(f"connectionId type: {type(phantom_agent['connectionId'])}")
+            raise
         
-        # Create signature object
+        # Sign the encoded message
+        signed = self.account.sign_message(encoded_message)
+        
+        # Extract signature using to_hex as the SDK does
+        # This ensures proper formatting
         signature = {
-            "r": "0x" + signed_message.r.to_bytes(32, "big").hex(),
-            "s": "0x" + signed_message.s.to_bytes(32, "big").hex(),
-            "v": signed_message.v
+            "r": to_hex(signed["r"]),
+            "s": to_hex(signed["s"]),
+            "v": signed["v"]
         }
         
-        # Build final request
-        return {
+        # Build final request - ALWAYS include vaultAddress (even if None) as SDK does
+        request_data = {
             "action": action,
-            "nonce": timestamp,
+            "nonce": nonce,
             "signature": signature,
-            "vaultAddress": None
+            "vaultAddress": vault_address  # SDK always includes this, even if None
         }
+        
+        logger.debug(f"Signed request: {json.dumps(request_data, indent=2, default=str)}")
+        return request_data
+    
+    async def _get_asset_info(self, symbol: str) -> dict:
+        """Get asset info for a symbol from Hyperliquid meta API
+        
+        Args:
+            symbol: Trading symbol (e.g. "BTC")
+            
+        Returns:
+            Dict with asset index and szDecimals
+        """
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                self.info_url,
+                json={"type": "meta"},
+                headers={"Content-Type": "application/json"}
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    for i, asset_info in enumerate(data.get("universe", [])):
+                        if asset_info.get("name") == symbol:
+                            return {
+                                "index": i,
+                                "szDecimals": asset_info.get("szDecimals", 5)
+                            }
+        raise ValueError(f"Asset {symbol} not found")
+    
+    async def _get_asset_index(self, symbol: str) -> int:
+        """Get asset index for a symbol from Hyperliquid meta API
+        
+        Args:
+            symbol: Trading symbol (e.g. "BTC")
+            
+        Returns:
+            Asset index (integer)
+        """
+        info = await self._get_asset_info(symbol)
+        return info["index"]
+    
+    async def _get_mid_price(self, symbol: str) -> float:
+        """Get current mid price for a symbol
+        
+        Args:
+            symbol: Trading symbol (e.g. "BTC")
+            
+        Returns:
+            Current mid price
+        """
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                self.info_url,
+                json={"type": "allMids"},
+                headers={"Content-Type": "application/json"}
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if symbol in data:
+                        return float(data[symbol])
+        raise ValueError(f"Could not get price for {symbol}")
+    
+    async def get_account_balance(self) -> float:
+        """Get your wallet's account balance from Hyperliquid
+        
+        Returns:
+            Account balance in USD
+        """
+        if not self.wallet_address:
+            raise ValueError("No wallet address configured")
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                self.info_url,
+                json={"type": "clearinghouseState", "user": self.wallet_address},
+                headers={"Content-Type": "application/json"}
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    # Get withdrawable balance (available margin)
+                    margin_summary = data.get("marginSummary", {})
+                    account_value = float(margin_summary.get("accountValue", 0))
+                    logger.debug(f"Your wallet balance: ${account_value:.2f}")
+                    return account_value
+        raise ValueError("Could not get account balance")
+    
+    def _format_size(self, size: float, sz_decimals: int = 5) -> str:
+        """Format size with appropriate decimal places for Hyperliquid
+        
+        Args:
+            size: Order size
+            sz_decimals: Number of decimal places allowed for this asset
+            
+        Returns:
+            Formatted size string
+        """
+        if size == 0:
+            return "0"
+        
+        # Round to the exact number of decimal places allowed
+        rounded = round(size, sz_decimals)
+        
+        # Format with exact decimal places then strip trailing zeros
+        formatted = f"{rounded:.{sz_decimals}f}".rstrip('0').rstrip('.')
+        return formatted
+    
+    def _calculate_slippage_price(self, price: float, is_buy: bool, slippage: float = 0.03) -> str:
+        """Calculate price with slippage for market orders
+        
+        Args:
+            price: Current market price
+            is_buy: True for buy orders, False for sell
+            slippage: Slippage percentage (default 3%)
+            
+        Returns:
+            Price string with slippage applied
+        """
+        # Apply slippage: higher price for buys, lower for sells
+        slippage_price = price * (1 + slippage) if is_buy else price * (1 - slippage)
+        # Round to 5 significant figures
+        return f"{slippage_price:.5g}"
     
     async def _update_leverage(
         self,
@@ -136,9 +296,13 @@ class TradeExecutor:
             True if successful, False otherwise
         """
         try:
+            # Get asset index from symbol name - Hyperliquid requires integer asset index!
+            asset_index = await self._get_asset_index(symbol)
+            logger.debug(f"Asset {symbol} has index {asset_index}")
+            
             action = {
                 "type": "updateLeverage",
-                "asset": symbol,
+                "asset": asset_index,  # MUST be integer asset index, not string!
                 "isCross": is_cross,
                 "leverage": leverage
             }
@@ -152,12 +316,20 @@ class TradeExecutor:
                     headers={"Content-Type": "application/json"}
                 ) as response:
                     if response.status == 200:
-                        await response.json()  # Read response
-                        logger.success(f"✅ Updated leverage for {symbol} to {leverage}x")
-                        return True
+                        try:
+                            result = await response.json()
+                            logger.debug(f"Response: {json.dumps(result, indent=2)}")
+                            logger.success(f"✅ Updated leverage for {symbol} to {leverage}x")
+                            return True
+                        except Exception as e:
+                            response_text = await response.text()
+                            logger.debug(f"Response text: {response_text}")
+                            logger.success(f"✅ Updated leverage for {symbol} to {leverage}x")
+                            return True
                     else:
-                        error_text = await response.text()
-                        logger.error(f"Failed to update leverage: {error_text}")
+                        response_text = await response.text()
+                        logger.error(f"Failed to update leverage: Status {response.status}")
+                        logger.error(f"Response: {response_text}")
                         return False
                         
         except Exception as e:
@@ -198,22 +370,38 @@ class TradeExecutor:
             if leverage > 1:
                 await self._update_leverage(symbol, leverage)
             
-            # Create market order action (price 0 = market order)
+            # Get asset info - includes index and szDecimals
+            asset_info = await self._get_asset_info(symbol)
+            asset_index = asset_info["index"]
+            sz_decimals = asset_info["szDecimals"]
+            
+            # Get current price and apply slippage for market order
+            # Hyperliquid uses IOC limit orders with slippage for "market" orders
+            is_buy = side == OrderSide.BUY
+            mid_price = await self._get_mid_price(symbol)
+            slippage_price = self._calculate_slippage_price(mid_price, is_buy)
+            logger.debug(f"Market order: mid={mid_price}, slippage_price={slippage_price}, is_buy={is_buy}")
+            
+            # Create market order action (SDK format)
+            # "a" = asset index (int), "b" = is_buy, "p" = price with slippage, "s" = size, "r" = reduce_only, "t" = order type
+            formatted_size = self._format_size(float(size), sz_decimals)
             action = {
                 "type": "order",
                 "orders": [{
-                    "a": self.wallet_address,
-                    "b": side == OrderSide.BUY,
-                    "p": "0",  # 0 = market order
-                    "s": str(float(size)),
+                    "a": asset_index,
+                    "b": is_buy,
+                    "p": slippage_price,  # Price with slippage applied
+                    "s": formatted_size,
                     "r": reduce_only,
-                    "t": {"limit": {"tif": "Ioc"}},  # Immediate or Cancel
-                    "c": symbol
+                    "t": {"limit": {"tif": "Ioc"}}  # Immediate or Cancel
                 }],
                 "grouping": "na"
             }
             
             signed_action = self._sign_action(action)
+            
+            # Debug: Log the full request
+            logger.debug(f"Market order request: {json.dumps(signed_action, indent=2, default=str)}")
             
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -221,20 +409,39 @@ class TradeExecutor:
                     json=signed_action,
                     headers={"Content-Type": "application/json"}
                 ) as response:
+                    response_text = await response.text()
+                    logger.debug(f"Market order response [{response.status}]: {response_text}")
+                    
                     if response.status == 200:
-                        result = await response.json()
-                        logger.success(
-                            f"✅ Market {side.value} order executed: {symbol} "
-                            f"size={size} leverage={leverage}x"
-                        )
-                        # Extract order ID from response
-                        if result.get("status") == "ok" and result.get("response", {}).get("data"):
-                            order_id = result["response"]["data"].get("statuses", [{}])[0].get("resting", {}).get("oid")
-                            return order_id
-                        return "executed"  # Order filled immediately
+                        try:
+                            result = json.loads(response_text)
+                            if result.get("status") == "ok":
+                                # Check for errors in statuses array
+                                statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+                                if statuses and "error" in statuses[0]:
+                                    error_msg = statuses[0]["error"]
+                                    logger.error(f"Order failed: {error_msg}")
+                                    return None
+                                
+                                logger.success(
+                                    f"✅ Market {side.value} order executed: {symbol} "
+                                    f"size={formatted_size} leverage={leverage}x"
+                                )
+                                # Extract order ID or filled status
+                                if statuses:
+                                    if "resting" in statuses[0]:
+                                        return statuses[0]["resting"].get("oid")
+                                    elif "filled" in statuses[0]:
+                                        return "filled"
+                                return "executed"  # Order executed
+                            else:
+                                logger.error(f"Order rejected: {result}")
+                                return None
+                        except json.JSONDecodeError:
+                            logger.error(f"Failed to parse response: {response_text}")
+                            return None
                     else:
-                        error_text = await response.text()
-                        logger.error(f"Failed to execute market order: {error_text}")
+                        logger.error(f"Failed to execute market order: {response_text}")
                         return None
                         
         except Exception as e:
@@ -280,19 +487,24 @@ class TradeExecutor:
             if leverage > 1:
                 await self._update_leverage(symbol, leverage)
             
-            # Create limit order action
+            # Get asset info - includes index and szDecimals
+            asset_info = await self._get_asset_info(symbol)
+            asset_index = asset_info["index"]
+            sz_decimals = asset_info["szDecimals"]
+            
+            # Create limit order action (SDK format)
             tif = "Alo" if post_only else "Gtc"  # Alo = Add Liquidity Only, Gtc = Good Till Cancel
+            formatted_size = self._format_size(float(size), sz_decimals)
             
             action = {
                 "type": "order",
                 "orders": [{
-                    "a": self.wallet_address,
+                    "a": asset_index,
                     "b": side == OrderSide.BUY,
                     "p": str(float(price)),
-                    "s": str(float(size)),
+                    "s": formatted_size,
                     "r": reduce_only,
-                    "t": {"limit": {"tif": tif}},
-                    "c": symbol
+                    "t": {"limit": {"tif": tif}}
                 }],
                 "grouping": "na"
             }
@@ -367,11 +579,15 @@ class TradeExecutor:
             return True
         
         try:
+            # Get asset index - Hyperliquid requires integer asset index!
+            asset_index = await self._get_asset_index(symbol)
+            
+            # Cancel action format (SDK format)
             action = {
                 "type": "cancel",
                 "cancels": [{
-                    "a": self.wallet_address,
-                    "o": order_id
+                    "a": asset_index,
+                    "o": int(order_id)
                 }]
             }
             

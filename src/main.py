@@ -30,6 +30,9 @@ simulated_balance = 0.0
 simulated_positions = {}  # symbol -> {'size': float, 'entry_price': float, 'side': str}
 simulated_pnl = 0.0
 
+# Your actual wallet balance (for proportional sizing in live mode)
+your_actual_balance = 0.0
+
 
 def calculate_adjusted_leverage(target_leverage: float, adjustment_ratio: float, symbol: str) -> int:
     """
@@ -442,11 +445,11 @@ async def on_order_fill(fill_data: dict):
                 liquidation_price=0.0
             )
         
-        # Calculate our fill size
+        # Calculate our fill size using YOUR actual wallet balance
         our_size = position_sizer.calculate_size(
             target_position=target_position,
             target_wallet_balance=monitor.current_state.balance if monitor.current_state else 1000000,
-            your_wallet_balance=simulated_balance if settings.simulated_trading else (monitor.current_state.balance if monitor.current_state else 10000)
+            your_wallet_balance=your_actual_balance if your_actual_balance > 0 else simulated_balance
         )
         
         if not our_size:
@@ -478,12 +481,21 @@ async def on_order_fill(fill_data: dict):
         else:
             logger.info(f"   Order Type: MARKET")
         
+        # Convert PositionSide to OrderSide based on direction
+        # Open Long = BUY, Close Long = SELL, Open Short = SELL, Close Short = BUY
+        if "Open" in direction:
+            order_side = OrderSide.BUY if position_side == PositionSide.LONG else OrderSide.SELL
+        else:  # Close
+            order_side = OrderSide.SELL if position_side == PositionSide.LONG else OrderSide.BUY
+        
+        logger.info(f"   Order Side: {order_side.value}")
+        
         # Execute the order
         if use_limit:
             # Place limit order at the fill price
             result = await executor.execute_limit_order(
                 symbol=symbol,
-                side=position_side,
+                side=order_side,
                 size=our_size,
                 price=price,
                 leverage=our_leverage
@@ -492,7 +504,7 @@ async def on_order_fill(fill_data: dict):
             # Place market order (original behavior)
             result = await executor.execute_market_order(
                 symbol=symbol,
-                side=position_side,
+                side=order_side,
                 size=our_size,
                 leverage=our_leverage
             )
@@ -785,11 +797,24 @@ async def main():
     )
     
     executor = TradeExecutor(
-        settings.hyperliquid.api_url,
-        settings.hyperliquid.wallet_address,
-        settings.hyperliquid.private_key,
-        dry_run=True  # Always start in dry run mode for safety!
+        info_url=f"{settings.hyperliquid.api_url}/info",
+        exchange_url=f"{settings.hyperliquid.api_url}/exchange",
+        wallet_address=settings.hyperliquid.wallet_address,
+        private_key=settings.hyperliquid.private_key,
+        dry_run=settings.simulated_trading
     )
+    
+    # Fetch YOUR actual wallet balance for proportional sizing
+    global your_actual_balance
+    if not settings.simulated_trading:
+        try:
+            your_actual_balance = await executor.get_account_balance()
+            logger.success(f"💰 Your wallet balance: ${your_actual_balance:,.2f}")
+        except Exception as e:
+            logger.warning(f"Could not fetch your balance: {e}, using simulated balance")
+            your_actual_balance = simulated_balance
+    else:
+        your_actual_balance = simulated_balance
     
     # Fetch target wallet state to auto-calculate ratio
     logger.info(f"\n📊 Fetching initial state...")
@@ -803,15 +828,18 @@ async def main():
         logger.info(f"   Unrealized PnL: ${state.unrealized_pnl:,.2f}")
         logger.info(f"   Open Positions: {len(state.positions)}")
         
-        # Auto-calculate ratio based on balances
-        auto_ratio = simulated_balance / target_balance
+        # Auto-calculate ratio based on balances (YOUR balance / TARGET balance)
+        auto_ratio = your_actual_balance / target_balance if target_balance > 0 else 1.0
         settings.sizing.portfolio_ratio = auto_ratio
         
         logger.success(f"\n✨ AUTO-CALCULATED SIZING:")
         logger.success(f"   Target Balance: ${target_balance:,.2f}")
-        logger.success(f"   Your Balance: ${simulated_balance:,.2f}")
-        logger.success(f"   📊 Ratio: 1:{int(1/auto_ratio)} ({auto_ratio*100:.4f}%)")
-        logger.success(f"   This means: For every ${int(1/auto_ratio)} target trades, you copy ${1}")
+        logger.success(f"   Your Balance: ${your_actual_balance:,.2f}")
+        logger.success(f"   📊 Ratio: {auto_ratio:.2f}x (Your trades are {auto_ratio:.2f}x larger than target)")
+        if auto_ratio >= 1:
+            logger.success(f"   This means: Target opens $100, you copy ${100*auto_ratio:.0f}")
+        else:
+            logger.success(f"   This means: Target opens $100, you copy ${100*auto_ratio:.2f}")
         
         if state.positions:
             logger.info(f"\n📊 Current Positions:")
