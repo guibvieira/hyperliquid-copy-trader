@@ -101,25 +101,54 @@ class WalletMonitor:
             logger.error(traceback.format_exc())
     
     async def _handle_fills(self, fills: List[dict]):
-        """Handle trade fills"""
+        """Handle trade fills
+        
+        Aggregates partial fills from the same order before processing.
+        Hyperliquid often splits orders into multiple fills, so we group
+        by order ID (oid) and sum the sizes to get the total order size.
+        """
+        from collections import defaultdict
+        
+        # Group fills by order ID to handle partial fills
+        fill_groups = defaultdict(lambda: {"fills": [], "total_size": 0.0})
+        
         for fill in fills:
             # Extract symbol from fill data
             symbol = fill.get("coin", "").upper()
             
             # Check if asset is blocked
-            # from ..config.settings import settings
             if symbol in settings.copy_rules.blocked_assets:
                 logger.warning(f"⛔ BLOCKED ASSET - Ignoring fill for {symbol} (in blocked list)")
                 continue
             
             logger.success(f"🎯 FILL DETECTED: {fill}")
             
+            # Group fills by order ID
+            oid = fill.get('oid')
+            if oid:
+                fill_groups[oid]["fills"].append(fill)
+                fill_groups[oid]["total_size"] += abs(float(fill.get('sz', 0)))
+            else:
+                # If no order ID, process individually (shouldn't happen normally)
+                logger.warning(f"⚠️ Fill has no order ID: {fill}")
+                fill_groups[None]["fills"].append(fill)
+                fill_groups[None]["total_size"] += abs(float(fill.get('sz', 0)))
+        
+        # Process each order once with aggregated size
+        for oid, group in fill_groups.items():
+            if len(group["fills"]) > 1:
+                logger.info(f"📦 Aggregated {len(group['fills'])} partial fills for order {oid}: total size = {group['total_size']}")
+            
+            # Use the first fill as template but with total size
+            fill_data = group["fills"][0].copy()
+            fill_data['sz'] = str(group["total_size"])  # Override with aggregated total
+            
             if self.on_order_fill:
                 try:
                     if asyncio.iscoroutinefunction(self.on_order_fill):
-                        await self.on_order_fill(fill)
+                        await self.on_order_fill(fill_data)
                     else:
-                        self.on_order_fill(fill)
+                        self.on_order_fill(fill_data)
                 except Exception as e:
                     logger.error(f"Error in fill callback: {e}")
     

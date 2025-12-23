@@ -47,7 +47,7 @@ class TradeExecutor:
                 private_key = self.private_key.strip()
                 if not private_key.startswith('0x') and not private_key.startswith('0X'):
                     private_key = '0x' + private_key
-                
+
                 self.account = Account.from_key(private_key)
                 # Validate address matches
                 if self.account.address.lower() != self.wallet_address.lower():
@@ -243,6 +243,44 @@ class TradeExecutor:
                     return account_value
         raise ValueError("Could not get account balance")
     
+    async def get_my_positions(self) -> Dict[str, Dict[str, Any]]:
+        """Get YOUR wallet's current positions from Hyperliquid
+        
+        Returns:
+            Dict mapping symbol to position info: {size, side, entry_price, leverage}
+        """
+        if not self.wallet_address:
+            raise ValueError("No wallet address configured")
+        
+        positions = {}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                self.info_url,
+                json={"type": "clearinghouseState", "user": self.wallet_address},
+                headers={"Content-Type": "application/json"}
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    asset_positions = data.get("assetPositions", [])
+                    
+                    for ap in asset_positions:
+                        pos = ap.get("position", {})
+                        coin = pos.get("coin", "")
+                        szi = float(pos.get("szi", 0))
+                        
+                        if abs(szi) > 0 and coin:
+                            positions[coin] = {
+                                "size": abs(szi),
+                                "side": "LONG" if szi > 0 else "SHORT",
+                                "signed_size": szi,
+                                "entry_price": float(pos.get("entryPx", 0)),
+                                "leverage": float(pos.get("leverage", {}).get("value", 1))
+                            }
+                            logger.debug(f"Your position: {coin} {positions[coin]}")
+                    
+                    return positions
+        raise ValueError("Could not get positions")
+    
     def _format_size(self, size: float, sz_decimals: int = 5) -> str:
         """Format size with appropriate decimal places for Hyperliquid
         
@@ -324,8 +362,8 @@ class TradeExecutor:
                         except Exception as e:
                             response_text = await response.text()
                             logger.debug(f"Response text: {response_text}")
-                            logger.success(f"✅ Updated leverage for {symbol} to {leverage}x")
-                            return True
+                        logger.success(f"✅ Updated leverage for {symbol} to {leverage}x")
+                        return True
                     else:
                         response_text = await response.text()
                         logger.error(f"Failed to update leverage: Status {response.status}")
@@ -400,8 +438,8 @@ class TradeExecutor:
             
             signed_action = self._sign_action(action)
             
-            # Debug: Log the full request
-            logger.debug(f"Market order request: {json.dumps(signed_action, indent=2, default=str)}")
+            # Log the request payload for debugging/auditing
+            logger.info(f"🔍 MARKET ORDER REQUEST PAYLOAD:\n{json.dumps(signed_action, indent=2, default=str)}")
             
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -410,7 +448,7 @@ class TradeExecutor:
                     headers={"Content-Type": "application/json"}
                 ) as response:
                     response_text = await response.text()
-                    logger.debug(f"Market order response [{response.status}]: {response_text}")
+                    logger.info(f"🔍 MARKET ORDER RESPONSE [{response.status}]: {response_text}")
                     
                     if response.status == 200:
                         try:
@@ -535,6 +573,120 @@ class TradeExecutor:
                         
         except Exception as e:
             logger.error(f"Error placing limit order: {e}")
+            return None
+    
+    async def execute_trigger_order(
+        self,
+        symbol: str,
+        side: OrderSide,
+        size: Decimal,
+        trigger_price: float,
+        is_take_profit: bool = False,
+        is_market: bool = True,
+        limit_price: Optional[float] = None,
+        reduce_only: bool = True
+    ) -> Optional[str]:
+        """Execute a stop-loss or take-profit trigger order
+        
+        Args:
+            symbol: Trading symbol (e.g. "BTC")
+            side: Order side (BUY or SELL)
+            size: Order size
+            trigger_price: Price at which to trigger the order
+            is_take_profit: True for TP, False for SL
+            is_market: True for market order when triggered, False for limit
+            limit_price: Required if is_market=False
+            reduce_only: If True, order will only reduce position (default True for TP/SL)
+            
+        Returns:
+            Order ID if successful, None otherwise
+        """
+        if self.dry_run:
+            order_type = "TP" if is_take_profit else "SL"
+            logger.info(f"🔵 DRY RUN: Would place {order_type} {side.value} {size} {symbol} @ trigger ${trigger_price}")
+            return f"dry_run_{order_type.lower()}_{symbol}_{int(time.time())}"
+        
+        try:
+            # Get asset info
+            asset_info = await self._get_asset_info(symbol)
+            asset_index = asset_info["index"]
+            sz_decimals = asset_info["szDecimals"]
+            
+            formatted_size = self._format_size(float(size), sz_decimals)
+            is_buy = side == OrderSide.BUY
+            
+            # For trigger orders, limit_px is the trigger price if market, or limit price if limit
+            if is_market:
+                # For market trigger orders, set a slippage price as the limit
+                order_limit_price = self._calculate_slippage_price(trigger_price, is_buy, slippage=0.05)
+            else:
+                order_limit_price = str(limit_price) if limit_price else str(trigger_price)
+            
+            # Create trigger order action
+            # tpsl: "tp" for take profit, "sl" for stop loss
+            tpsl = "tp" if is_take_profit else "sl"
+            
+            # Key order in trigger object must match SDK: isMarket, triggerPx, tpsl
+            # CRITICAL: Hyperliquid requires max 5 significant figures for ALL prices
+            # NOTE: Using isMarket=False (trigger limit) as standalone trigger market orders may not be supported
+            action = {
+                "type": "order",
+                "orders": [{
+                    "a": asset_index,
+                    "b": is_buy,
+                    "p": order_limit_price,  # Limit price when trigger hits
+                    "s": formatted_size,
+                    "r": reduce_only,
+                    "t": {
+                        "trigger": {
+                            "isMarket": False,  # Always use trigger limit orders
+                            "triggerPx": f"{trigger_price:.5g}",  # .5g enforces max 5 sig figs
+                            "tpsl": tpsl
+                        }
+                    }
+                }],
+                "grouping": "normalTpsl"  # Normal TP/SL grouping
+            }
+            
+            signed_action = self._sign_action(action)
+            
+            order_type = "TP" if is_take_profit else "SL"
+            logger.info(f"🔍 {order_type} ORDER REQUEST:\n{json.dumps(signed_action, indent=2, default=str)}")
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.exchange_url,
+                    json=signed_action,
+                    headers={"Content-Type": "application/json"}
+                ) as response:
+                    response_text = await response.text()
+                    logger.info(f"🔍 {order_type} ORDER RESPONSE [{response.status}]: {response_text}")
+                    
+                    if response.status == 200:
+                        try:
+                            result = json.loads(response_text)
+                            if result.get("status") == "ok":
+                                statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+                                if statuses and "resting" in statuses[0]:
+                                    order_id = statuses[0]["resting"]["oid"]
+                                    logger.success(f"✅ {order_type} order placed: {symbol} trigger @ ${trigger_price}")
+                                    return str(order_id)
+                                elif statuses and "error" in statuses[0]:
+                                    logger.error(f"{order_type} order failed: {statuses[0]['error']}")
+                                    return None
+                            else:
+                                logger.error(f"{order_type} order failed: {result}")
+                                return None
+                        except Exception as e:
+                            logger.error(f"Error parsing {order_type} order response: {e}")
+                            return None
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Failed to place {order_type} order: {error_text}")
+                        return None
+                        
+        except Exception as e:
+            logger.error(f"Error placing trigger order: {e}")
             return None
     
     async def close_position(

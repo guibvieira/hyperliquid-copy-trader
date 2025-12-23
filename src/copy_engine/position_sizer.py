@@ -88,23 +88,33 @@ class PositionSizer:
             Target opens: $5k position
             Your position: $5k * 0.01 = $50
         """
+        logger.info(f"🔍 POSITION_SIZER: Starting proportional size calculation")
+        logger.info(f"   Target Position: {target_position.size:.6f} {target_position.symbol} @ ${target_position.entry_price:,.2f}")
+        logger.info(f"   Target Wallet Balance: ${target_wallet_balance:,.2f}")
+        logger.info(f"   Your Wallet Balance: ${your_wallet_balance:,.2f}")
+        
         # Calculate target position notional value
         target_notional = target_position.size * target_position.entry_price
+        logger.info(f"   Target Position Notional: ${target_notional:,.2f}")
         
         # Calculate the ratio between wallets
         if target_wallet_balance > 0:
             wallet_ratio = your_wallet_balance / target_wallet_balance
+            logger.info(f"   Calculated Wallet Ratio: {wallet_ratio:.6f} (from balances)")
         else:
             wallet_ratio = self.portfolio_ratio
+            logger.warning(f"   Target balance is 0, using portfolio_ratio: {wallet_ratio:.6f}")
         
         # Calculate your position size
         your_notional = target_notional * wallet_ratio
+        logger.info(f"   Your Position Notional: ${your_notional:,.2f} (${target_notional:,.2f} * {wallet_ratio:.6f})")
         
         # Convert back to size (coins)
         your_size = your_notional / target_position.entry_price if target_position.entry_price > 0 else 0
+        logger.info(f"   Your Position Size: {your_size:.6f} {target_position.symbol} (${your_notional:,.2f} / ${target_position.entry_price:,.2f})")
         
         logger.info(
-            f"Proportional sizing: Target ${target_notional:.2f} -> Your ${your_notional:.2f} "
+            f"✅ Proportional sizing: Target ${target_notional:.2f} -> Your ${your_notional:.2f} "
             f"({wallet_ratio:.4f} ratio) = {your_size:.4f} coins"
         )
         

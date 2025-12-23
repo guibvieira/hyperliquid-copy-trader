@@ -66,8 +66,9 @@ class HyperliquidClient:
                         size = float(position.get("szi", 0))
                         side = PositionSide.LONG if size > 0 else PositionSide.SHORT
                         
+                        # "coin" is inside the "position" object, not at top level
                         positions.append(Position(
-                            symbol=pos_data.get("coin", ""),
+                            symbol=position.get("coin", ""),
                             side=side,
                             size=abs(size),
                             entry_price=float(position.get("entryPx", 0)),

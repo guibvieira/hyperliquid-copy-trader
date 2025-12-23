@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime
+from decimal import Decimal
 from loguru import logger
 from config.settings import settings
 from utils.logger import setup_logger
@@ -33,23 +34,12 @@ simulated_pnl = 0.0
 # Your actual wallet balance (for proportional sizing in live mode)
 your_actual_balance = 0.0
 
+# YOUR positions cache - updated periodically and on fills
+your_positions_cache = {}  # symbol -> {'size': float, 'side': str, 'entry_price': float}
 
-def calculate_adjusted_leverage(target_leverage: float, adjustment_ratio: float, symbol: str) -> int:
-    """
-    Calculate adjusted leverage with proper rounding and max leverage limits.
-    
-    Hyperliquid only supports integer leverage (1x, 2x, 3x, etc.)
-    Each asset has different max leverage limits.
-    
-    Args:
-        target_leverage: Target wallet's leverage
-        adjustment_ratio: Multiplier (e.g., 0.5 = use 50% of target's leverage)
-        symbol: Trading symbol (for max leverage lookup)
-    
-    Returns:
-        Integer leverage between 1 and the asset's max leverage
-    """
-    # Asset-specific max leverage limits on Hyperliquid
+
+def get_max_leverage_for_asset(symbol: str) -> int:
+    """Get the maximum allowed leverage for an asset on Hyperliquid"""
     MAX_LEVERAGE_LIMITS = {
         'BTC': 50,
         'ETH': 50,
@@ -83,15 +73,27 @@ def calculate_adjusted_leverage(target_leverage: float, adjustment_ratio: float,
         'MELANIA': 10,
         'PUMP': 10,
     }
+    return MAX_LEVERAGE_LIMITS.get(symbol.upper(), 10)
+
+
+def calculate_matching_leverage(target_leverage: float, symbol: str) -> int:
+    """
+    Calculate leverage to match target's leverage exactly (for true proportional copying).
     
-    # Get max leverage for this asset (default to 10x if unknown)
-    max_leverage = MAX_LEVERAGE_LIMITS.get(symbol.upper(), 10)
+    Hyperliquid only supports integer leverage (1x, 2x, 3x, etc.)
+    We round to nearest integer and cap at asset's max leverage.
     
-    # Calculate desired leverage
-    desired_leverage = target_leverage * adjustment_ratio
+    Args:
+        target_leverage: Target wallet's leverage
+        symbol: Trading symbol (for max leverage lookup)
+    
+    Returns:
+        Integer leverage matching target's (capped at asset max)
+    """
+    max_leverage = get_max_leverage_for_asset(symbol)
     
     # Round to nearest integer
-    rounded_leverage = round(desired_leverage)
+    rounded_leverage = round(target_leverage)
     
     # Ensure minimum of 1x
     rounded_leverage = max(1, rounded_leverage)
@@ -185,12 +187,10 @@ async def on_new_position(position_data: dict):
         else:
             your_size = settings.sizing.fixed_size / entry_price if entry_price > 0 else 0
         
-        # Calculate adjusted leverage
-        your_leverage = position_sizer.calculate_leverage(
-            target_leverage,
-            settings.leverage.adjustment_ratio,
-            settings.leverage.max_leverage,
-            settings.leverage.min_leverage
+        # Use SAME leverage as target for true proportional copying
+        your_leverage = calculate_matching_leverage(
+            target_leverage=target_leverage,
+            symbol=symbol
         )
         
         logger.info(f"\n� Your Position:")
@@ -292,10 +292,14 @@ async def on_position_update(position_data: dict):
 
 async def on_new_order(order_data: dict):
     """
-    Called when target wallet places a new order
-    Copy limit orders and stop losses
+    Called when target wallet places a new order.
+    Handles:
+    - Limit orders
+    - Stop-loss (SL) trigger orders
+    - Take-profit (TP) trigger orders
     """
-    global trades_copied_count, is_paused, simulated_balance
+    global trades_copied_count, is_paused, simulated_balance, simulated_positions
+    global your_positions_cache
     
     # Check if paused
     if is_paused:
@@ -315,75 +319,219 @@ async def on_new_order(order_data: dict):
     
     try:
         symbol = order_data.get('coin', '')
-        side = order_data.get('side', '')
-        order_type = order_data.get('orderType', 'limit')
+        side_str = order_data.get('side', '')  # 'B' for buy, 'A' for sell
+        order_type = order_data.get('orderType', 'Limit')
         target_size = abs(float(order_data.get('sz', 0)))
-        price = float(order_data.get('limitPx', 0))
+        limit_price = float(order_data.get('limitPx', 0)) if order_data.get('limitPx') else 0
+        trigger_price = float(order_data.get('triggerPx', 0)) if order_data.get('triggerPx') else None
+        is_trigger = order_data.get('isTrigger', False)
+        is_position_tpsl = order_data.get('isPositionTpsl', False)
+        trigger_condition = order_data.get('triggerCondition', '')  # "gt" or "lt"
+        reduce_only = order_data.get('reduceOnly', False)
+        
+        # Convert side
+        order_side = OrderSide.BUY if side_str == 'B' else OrderSide.SELL
+        
+        # Determine if this is a TP or SL based on trigger condition
+        # For longs: SL triggers when price < trigger (lt), TP triggers when price > trigger (gt)
+        # For shorts: SL triggers when price > trigger (gt), TP triggers when price < trigger (lt)
+        is_take_profit = False
+        is_stop_loss = False
+        
+        if is_trigger or trigger_price:
+            # Determine TP vs SL
+            # If we have a position, check which direction this protects
+            if trigger_condition == 'gt':
+                # Triggers when price goes above trigger_price
+                # For a SHORT position closing (BUY), this would be a SL
+                # For a LONG position closing (SELL), this would be a TP
+                is_take_profit = (order_side == OrderSide.SELL)
+                is_stop_loss = (order_side == OrderSide.BUY)
+            elif trigger_condition == 'lt':
+                # Triggers when price goes below trigger_price
+                # For a LONG position closing (SELL), this would be a SL
+                # For a SHORT position closing (BUY), this would be a TP
+                is_stop_loss = (order_side == OrderSide.SELL)
+                is_take_profit = (order_side == OrderSide.BUY)
+        
+        order_type_display = "LIMIT"
+        if is_stop_loss:
+            order_type_display = "STOP-LOSS"
+        elif is_take_profit:
+            order_type_display = "TAKE-PROFIT"
+        elif is_trigger:
+            order_type_display = "TRIGGER"
         
         logger.info(f"\n{'='*50}")
-        logger.info(f"📋 NEW ORDER DETECTED!")
+        logger.info(f"📋 NEW ORDER DETECTED - {order_type_display}!")
         logger.info(f"{'='*50}")
         logger.info(f"Symbol: {symbol}")
-        logger.info(f"Side: {side}")
-        logger.info(f"Type: {order_type}")
+        logger.info(f"Side: {order_side.value}")
+        logger.info(f"Type: {order_type_display}")
         logger.info(f"Target Size: {target_size}")
-        logger.info(f"Price: ${price:,.2f}")
+        if trigger_price:
+            logger.info(f"Trigger Price: ${trigger_price:,.2f}")
+        if limit_price:
+            logger.info(f"Limit Price: ${limit_price:,.2f}")
+        if reduce_only:
+            logger.info(f"Reduce Only: {reduce_only}")
         
-        # Calculate our order size
-        if settings.copy_rules.auto_adjust_size:
-            our_size = position_sizer.calculate_size(
-                target_size=target_size,
-                symbol=symbol,
-                current_exposure=monitor.current_state.total_equity if monitor.current_state else 0
-            )
+        # ============================================
+        # CALCULATE SIZE FOR TP/SL BASED ON YOUR POSITION
+        # ============================================
+        if is_stop_loss or is_take_profit:
+            # For TP/SL, size should be based on YOUR position, not proportional
+            your_position_size = 0.0
+            
+            if not settings.simulated_trading:
+                try:
+                    your_positions_cache = await executor.get_my_positions()
+                    if symbol in your_positions_cache:
+                        your_position_size = your_positions_cache[symbol]["size"]
+                        logger.info(f"📊 Your {symbol} position: {your_position_size:.6f}")
+                except Exception as e:
+                    logger.warning(f"Could not fetch your positions: {e}")
+            else:
+                if symbol in simulated_positions:
+                    your_position_size = abs(simulated_positions[symbol].get('size', 0))
+            
+            if your_position_size <= 0:
+                logger.warning(f"⚠️ Skipping {order_type_display} - no position to protect!")
+                return
+            
+            # Calculate close ratio from target's position
+            target_position_size = 0.0
+            if monitor.current_state:
+                for pos in monitor.current_state.positions:
+                    if pos.symbol == symbol:
+                        target_position_size = abs(pos.size)
+                        break
+            
+            if target_position_size > 0:
+                close_ratio = target_size / target_position_size
+                our_size = your_position_size * close_ratio
+                logger.info(f"📊 {order_type_display} Sizing:")
+                logger.info(f"   Target position: {target_position_size:.6f}")
+                logger.info(f"   Target {order_type_display}: {target_size:.6f} ({close_ratio*100:.1f}%)")
+                logger.info(f"   Your position: {your_position_size:.6f}")
+                logger.info(f"   → Your {order_type_display}: {our_size:.6f} ({close_ratio*100:.1f}%)")
+            else:
+                # Full position TP/SL
+                our_size = your_position_size
+                logger.info(f"📊 Full position {order_type_display}: {our_size:.6f}")
         else:
-            our_size = target_size
-        
-        logger.info(f"\n📊 Order Sizing:")
-        logger.info(f"   Our Size: {our_size:.4f}")
-        
-        # Execute the order
-        result = await executor.execute_limit_order(
-            symbol=symbol,
-            side=side,
-            size=our_size,
-            price=price
-        )
-        
-        if result:
-            logger.success(f"✅ Order copied successfully!")
-            trades_copied_count += 1
-            
-            # Log simulated order
-            if settings.simulated_trading:
-                order_value = our_size * price
-                logger.success(f"\n📋 SIMULATED ORDER PLACED!")
-                logger.success(f"   Order Value: ${order_value:,.2f}")
-                logger.success(f"   Account Balance: ${simulated_balance:,.2f}")
-            
-            # Send notification
-            if notifier:
-                await notifier.send_trade_notification(
+            # For regular limit orders, use proportional sizing
+            if settings.copy_rules.auto_adjust_size:
+                # Create a placeholder position for sizing
+                from hyperliquid.models import Position
+                target_position = Position(
                     symbol=symbol,
-                    side=side,
-                    size=our_size,
-                    price=price,
-                    leverage=1.0,  # Orders don't have leverage until filled
-                    target_size=target_size
+                    size=target_size,
+                    side=PositionSide.LONG if order_side == OrderSide.BUY else PositionSide.SHORT,
+                    entry_price=limit_price,
+                    current_price=limit_price,
+                    leverage=1.0,
+                    unrealized_pnl=0.0,
+                    liquidation_price=0.0
                 )
+                our_size = position_sizer.calculate_size(
+                    target_position=target_position,
+                    target_wallet_balance=monitor.current_state.balance if monitor.current_state else 1000000,
+                    your_wallet_balance=your_actual_balance if your_actual_balance > 0 else simulated_balance
+                )
+            else:
+                our_size = target_size
+            
+            logger.info(f"\n📊 Order Sizing:")
+            logger.info(f"   Our Size: {our_size:.6f}")
+        
+        if not our_size or our_size <= 0:
+            logger.warning(f"⚠️ Skipping order - size is zero")
+            return
+        
+        # Execute the order based on type
+        if is_stop_loss or is_take_profit:
+            # Place TP/SL trigger order
+            result = await executor.execute_trigger_order(
+                symbol=symbol,
+                side=order_side,
+                size=our_size,
+                trigger_price=trigger_price,
+                is_take_profit=is_take_profit,
+                is_market=True,  # Execute as market when triggered
+                reduce_only=True  # TP/SL always reduce only
+            )
+            
+            if result:
+                logger.success(f"✅ {order_type_display} order copied successfully!")
+                trades_copied_count += 1
+                
+                if notifier:
+                    await notifier.send_trade_notification(
+                        symbol=symbol,
+                        side=order_side.value,
+                        size=our_size,
+                        price=trigger_price,
+                        leverage=1.0,
+                        target_size=target_size
+                    )
+            else:
+                logger.error(f"❌ Failed to copy {order_type_display} order")
         else:
-            logger.error(f"❌ Failed to copy order")
+            # Place regular limit order
+            result = await executor.execute_limit_order(
+                symbol=symbol,
+                side=order_side,
+                size=Decimal(str(our_size)),
+                price=Decimal(str(limit_price)),
+                reduce_only=reduce_only
+            )
+            
+            if result:
+                logger.success(f"✅ Limit order copied successfully!")
+                trades_copied_count += 1
+                
+                # Log simulated order
+                if settings.simulated_trading:
+                    order_value = our_size * limit_price
+                    logger.success(f"\n📋 SIMULATED ORDER PLACED!")
+                    logger.success(f"   Order Value: ${order_value:,.2f}")
+                    logger.success(f"   Account Balance: ${simulated_balance:,.2f}")
+                
+                # Send notification
+                if notifier:
+                    await notifier.send_trade_notification(
+                        symbol=symbol,
+                        side=order_side.value,
+                        size=our_size,
+                        price=limit_price,
+                        leverage=1.0,
+                        target_size=target_size
+                    )
+            else:
+                logger.error(f"❌ Failed to copy limit order")
             
     except Exception as e:
         logger.error(f"Error copying order: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 
 
 async def on_order_fill(fill_data: dict):
     """
     Called when an order is filled
     Copy the filled order
+    
+    CRITICAL: For CLOSE orders, we must check YOUR actual position size,
+    not just scale the target's close size proportionally. Otherwise we
+    can overfill and accidentally open a reverse position.
+    
+    NOTE: Hyperliquid can split orders into multiple partial fills. Partial fills
+    are aggregated by order ID in monitor.py before this function is called,
+    so this function receives the complete order with total size.
     """
     global trades_copied_count, is_paused, simulated_balance, simulated_positions, simulated_pnl
+    global your_positions_cache
     
     # Check if paused
     if is_paused:
@@ -391,17 +539,27 @@ async def on_order_fill(fill_data: dict):
         return
     
     try:
+        # Extract order ID for logging (aggregation is handled in monitor.py)
+        order_id = fill_data.get('oid')
+        
         symbol = fill_data.get('coin', '')
-        side_str = fill_data.get('side', '')  # 'B' for buy, 'S' for sell
+        side_str = fill_data.get('side', '')  # 'B' for buy, 'A' for sell/ask
         target_size = abs(float(fill_data.get('sz', 0)))
         price = float(fill_data.get('px', 0))
         direction = fill_data.get('dir', '')  # e.g., "Open Long", "Close Short"
         crossed = fill_data.get('crossed', False)  # True if crossed the spread (maker), False if took liquidity (taker)
         
+        # The 'startPosition' field tells us the position before this fill
+        start_position = float(fill_data.get('startPosition', 0))
+        
+        # Note: Partial fills are aggregated by order ID in monitor.py before this function is called
+        logger.debug(f"📊 Fill details: order_id={order_id}, size={target_size}, startPosition={start_position}")
+        
         # Determine if this was likely a market or limit order
-        # If crossed=False, it's typically a market order (taker)
-        # If crossed=True, it's typically a limit order that got filled (maker)
         order_type = "LIMIT" if crossed else "MARKET"
+        
+        # Determine if this is an OPEN or CLOSE
+        is_closing = "Close" in direction
         
         # Convert side to PositionSide
         if "Long" in direction:
@@ -413,60 +571,142 @@ async def on_order_fill(fill_data: dict):
             position_side = PositionSide.LONG if side_str == "B" else PositionSide.SHORT
         
         logger.info(f"\n{'='*50}")
-        logger.info(f"📋 FILL TO COPY!")
+        logger.info(f"📋 FILL TO COPY - {'CLOSE' if is_closing else 'OPEN'}")
         logger.info(f"{'='*50}")
         logger.info(f"Symbol: {symbol}")
-        logger.info(f"Side: {position_side.value.upper()}")
         logger.info(f"Direction: {direction}")
         logger.info(f"Target Order Type: {order_type}")
         logger.info(f"Target Size: {target_size}")
         logger.info(f"Price: ${price:,.4f}")
         
-        # Get target position to calculate our size
-        target_position = None
+        # ============================================
+        # FETCH YOUR ACTUAL POSITION (critical for closes!)
+        # ============================================
+        your_position_size = 0.0
+        your_position_side = None
+        
+        if not settings.simulated_trading:
+            try:
+                your_positions_cache = await executor.get_my_positions()
+                if symbol in your_positions_cache:
+                    your_pos = your_positions_cache[symbol]
+                    your_position_size = your_pos["size"]
+                    your_position_side = your_pos["side"]
+                    logger.info(f"📊 YOUR current {symbol} position: {your_position_size:.6f} {your_position_side}")
+            except Exception as e:
+                logger.warning(f"Could not fetch your positions: {e}")
+        else:
+            # Use simulated position tracking
+            if symbol in simulated_positions:
+                your_position_size = abs(simulated_positions[symbol].get('size', 0))
+                your_position_side = simulated_positions[symbol].get('side', None)
+                logger.info(f"📊 YOUR simulated {symbol} position: {your_position_size:.6f} {your_position_side}")
+        
+        # ============================================
+        # CALCULATE SIZE BASED ON OPEN vs CLOSE
+        # ============================================
+        if is_closing:
+            # FOR CLOSES: Use YOUR actual position size, NOT proportional scaling
+            if your_position_size <= 0:
+                logger.warning(f"⚠️ Skipping close - you have no {symbol} position to close!")
+                return
+            
+            # Calculate proportional close amount based on target's partial close ratio
+            target_state = monitor.current_state
+            target_position_before = float(fill_data.get('startPosition', 0))
+            
+            if abs(target_position_before) > 0:
+                # How much of target's position is being closed (as a ratio)?
+                close_ratio = target_size / abs(target_position_before)
+                
+                # Apply same ratio to YOUR position
+                our_size = your_position_size * close_ratio
+                
+                logger.info(f"📊 Close Sizing:")
+                logger.info(f"   Target had: {abs(target_position_before):.6f}")
+                logger.info(f"   Target closing: {target_size:.6f} ({close_ratio*100:.1f}%)")
+                logger.info(f"   Your position: {your_position_size:.6f}")
+                logger.info(f"   → You close: {our_size:.6f} ({close_ratio*100:.1f}% of yours)")
+            else:
+                # Full close - close your entire position
+                our_size = your_position_size
+                logger.info(f"📊 Full close - closing your entire position: {our_size:.6f}")
+            
+            # Safety check: Never close more than we have!
+            if our_size > your_position_size:
+                logger.warning(f"⚠️ Close size {our_size:.6f} > your position {your_position_size:.6f}, capping to your position")
+                our_size = your_position_size
+        else:
+            # FOR OPENS: Use proportional sizing as before
+            # Get target position to calculate our size
+            target_position = None
+            if monitor.current_state:
+                for pos in monitor.current_state.positions:
+                    if pos.symbol == symbol:
+                        target_position = pos
+                        break
+            
+            if not target_position:
+                # Create a placeholder position for sizing calculation
+                from hyperliquid.models import Position
+                target_position = Position(
+                    symbol=symbol,
+                    size=target_size,
+                    side=position_side,
+                    entry_price=price,
+                    current_price=price,
+                    leverage=1.0,
+                    unrealized_pnl=0.0,
+                    liquidation_price=0.0
+                )
+            
+            # Calculate our fill size using YOUR actual wallet balance
+            target_balance = monitor.current_state.balance if monitor.current_state else 1000000
+            
+            expected_ratio = your_actual_balance / target_balance if target_balance > 0 else 0
+            
+            logger.debug(f"🔍 Sizing calculation: Target ${target_position.size * target_position.entry_price:,.2f} @ {expected_ratio:.2f}x ratio")
+
+            our_size = position_sizer.calculate_size(
+                target_position=target_position,
+                target_wallet_balance=target_balance,
+                your_wallet_balance=your_actual_balance if your_actual_balance > 0 else simulated_balance
+            )
+            
+            logger.info(f"📊 Open Sizing:")
+            logger.info(f"   Target Size: {target_size:.6f}")
+            logger.info(f"   Our Size: {our_size:.6f}")
+            if our_size and target_size > 0:
+                actual_ratio = (our_size * price) / (target_size * price)
+                logger.info(f"   Actual Ratio: {actual_ratio:.2f}x (should be {expected_ratio:.2f}x)")
+                if abs(actual_ratio - expected_ratio) / expected_ratio > 0.1:  # More than 10% difference
+                    logger.error(f"   ⚠️ RATIO MISMATCH! Expected {expected_ratio:.2f}x but got {actual_ratio:.2f}x")
+        
+        if not our_size or our_size <= 0:
+            logger.warning(f"⚠️ Skipping fill - size is zero or None")
+            return
+        
+        # ============================================
+        # MINIMUM ORDER VALUE CHECK ($10 on Hyperliquid)
+        # ============================================
+        order_value = our_size * price
+        MIN_ORDER_VALUE = 10.0
+        
+        if order_value < MIN_ORDER_VALUE:
+            logger.warning(f"⚠️ Order value ${order_value:.2f} < minimum ${MIN_ORDER_VALUE}. Skipping (too small).")
+            return
+        
+        # Get target leverage
+        target_leverage = 1.0
         if monitor.current_state:
             for pos in monitor.current_state.positions:
                 if pos.symbol == symbol:
-                    target_position = pos
+                    target_leverage = pos.leverage
                     break
         
-        if not target_position:
-            logger.warning(f"⚠️ No position found for {symbol}, creating placeholder")
-            # Create a placeholder position for sizing calculation
-            from hyperliquid.models import Position
-            target_position = Position(
-                symbol=symbol,
-                size=target_size,
-                side=position_side,
-                entry_price=price,
-                current_price=price,
-                leverage=1.0,
-                unrealized_pnl=0.0,
-                liquidation_price=0.0
-            )
-        
-        # Calculate our fill size using YOUR actual wallet balance
-        our_size = position_sizer.calculate_size(
-            target_position=target_position,
-            target_wallet_balance=monitor.current_state.balance if monitor.current_state else 1000000,
-            your_wallet_balance=your_actual_balance if your_actual_balance > 0 else simulated_balance
-        )
-        
-        if not our_size:
-            logger.warning(f"⚠️ Skipping fill - size calculation returned None")
-            return
-        
-        logger.info(f"\n📊 Fill Sizing:")
-        logger.info(f"   Target Size: {target_size}")
-        logger.info(f"   Our Size: {our_size:.4f}")
-        
-        # Get target leverage
-        target_leverage = target_position.leverage if target_position else 1.0
-        
-        # Adjust leverage with proper rounding and max limits
-        our_leverage = calculate_adjusted_leverage(
+        # Use SAME leverage as target for true proportional copying
+        our_leverage = calculate_matching_leverage(
             target_leverage=target_leverage,
-            adjustment_ratio=settings.leverage.adjustment_ratio,
             symbol=symbol
         )
         
@@ -489,6 +729,7 @@ async def on_order_fill(fill_data: dict):
             order_side = OrderSide.SELL if position_side == PositionSide.LONG else OrderSide.BUY
         
         logger.info(f"   Order Side: {order_side.value}")
+        logger.info(f"   Reduce Only: {is_closing}")
         
         # Execute the order
         if use_limit:
@@ -498,15 +739,17 @@ async def on_order_fill(fill_data: dict):
                 side=order_side,
                 size=our_size,
                 price=price,
-                leverage=our_leverage
+                leverage=our_leverage,
+                reduce_only=is_closing  # IMPORTANT: Pass reduce_only for closes!
             )
         else:
-            # Place market order (original behavior)
+            # Place market order
             result = await executor.execute_market_order(
                 symbol=symbol,
                 side=order_side,
                 size=our_size,
-                leverage=our_leverage
+                leverage=our_leverage,
+                reduce_only=is_closing  # IMPORTANT: Pass reduce_only for closes!
             )
         
         if result:
@@ -850,9 +1093,8 @@ async def main():
                 target_position_value = abs(pos.size) * pos.entry_price
                 your_position_value = target_position_value * auto_ratio
                 your_size = your_position_value / pos.entry_price if pos.entry_price > 0 else 0
-                your_leverage = calculate_adjusted_leverage(
+                your_leverage = calculate_matching_leverage(
                     target_leverage=pos.leverage,
-                    adjustment_ratio=settings.leverage.adjustment_ratio,
                     symbol=pos.symbol
                 )
                 margin_needed = your_position_value / your_leverage
@@ -874,7 +1116,7 @@ async def main():
     
     logger.info(f"\n🔧 Copy Trading Settings:")
     logger.info(f"   Sizing Mode: {settings.sizing.mode}")
-    logger.info(f"   Leverage Adjustment: {settings.leverage.adjustment_ratio}x")
+    logger.info(f"   Leverage: Matching target (true proportional)")
     logger.info(f"   Max Position Size: ${settings.sizing.max_position_size:,.2f}")
     
     position_sizer = PositionSizer(
@@ -905,9 +1147,8 @@ async def main():
                 target_position_value = abs(pos.size) * pos.entry_price
                 your_position_value = target_position_value * auto_ratio
                 your_size = your_position_value / pos.entry_price if pos.entry_price > 0 else 0
-                your_leverage = calculate_adjusted_leverage(
+                your_leverage = calculate_matching_leverage(
                     target_leverage=pos.leverage,
-                    adjustment_ratio=settings.leverage.adjustment_ratio,
                     symbol=pos.symbol
                 )
                 margin_needed = your_position_value / your_leverage

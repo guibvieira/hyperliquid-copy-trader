@@ -9,3 +9,8 @@ services:
       - ./.env:/app/.env
     environment:
       - TZ=UTC
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
